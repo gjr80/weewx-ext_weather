@@ -14,16 +14,22 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
 details.
 
-Version: 0.2.0                                      Date: xx August 2024
+Version: 0.3.0a1                                    Date: xx August 2024
 
 Revision History
-    xx August 2024      v0.2.0
+    xx August 2024      v0.3.0
+        - restructured such that a single service (WeatherApiService) now runs
+          multiple threads with one weather API supported per thread
+        - change Collector/collector terminology to Source/source
+    13 August 2024      v0.2.0
         - refactored to use python 3.6 or later
         - refactored thread management to better handle thread closure
         - implemented a single XWeather Map service
+        - removed six.moves dependency
     2 April 2023        v0.1.0
         - initial implementation
 """
+#TODO. Need to sort out debug level in the service vs debug in the threads
 
 # python imports
 import os
@@ -99,21 +105,22 @@ except ImportError:
     def log_traceback_error(prefix=''):
         log_traceback(prefix=prefix, loglevel=syslog.LOG_ERR)
 
+WEATHER_API_VERSION = "0.3.0a1"
 
 # ============================================================================
-#                              class Collector
+#                                class Source
 # ============================================================================
 
-class Collector(object):
+class Source(object):
     """Base class for a threaded client that polls an API."""
 
-    def __init__(self, collector_dict):
-        # creat a queue object for passing data back to our parent
-        self.queue = queue.Queue()
+    def __init__(self, source_dict, control_queue, data_queue):
+        self.control_queue = control_queue
+        self.data_queue = data_queue
         self.thread = None
-        self.debug = weeutil.weeutil.to_int(collector_dict.get('debug', 0))
-        self.name = collector_dict.get('name', 'api_collector')
-        self.max_tries = weeutil.weeutil.to_int(collector_dict.get('max_tries', 2))
+        self.debug = weeutil.weeutil.to_int(source_dict.get('debug', 0))
+        self.name = source_dict.get('name', 'api_source')
+        self.max_tries = weeutil.weeutil.to_int(source_dict.get('max_tries', 2))
         self.collect_data = False
 
     def collect(self):
@@ -263,15 +270,15 @@ class Collector(object):
     def startup(self, name):
         """Start the thread that collects data from the API.
 
-        Start the collector in a daemonised thread and start collecting data.
+        Start the source in a daemonised thread and start collecting data.
         Child classes may should override this method if required.
         """
 
         # wrap in a try .. except in case there is a problem starting the
         # thread
         try:
-            # obtain a CollectorThread object
-            self.thread = Collector.CollectorThread(self)
+            # obtain a SourceThread object
+            self.thread = Source.SourceThread(self)
             # tell the thread to start collecting data
             self.collect_data = True
             # daemonise the thread
@@ -307,7 +314,7 @@ class Collector(object):
                 loginf("%s has been terminated" % name)
         self.thread = None
 
-    class CollectorThread(threading.Thread):
+    class SourceThread(threading.Thread):
         """Class using a thread to collect data via an API."""
 
         def __init__(self, client):
@@ -329,182 +336,359 @@ class Collector(object):
 
 
 # ============================================================================
-#                          class XWeatherMapService
+#                          class WeatherApiService
 # ============================================================================
 
-class XWeatherMapService(weewx.engine.StdService):
-    """Service to obtain a weather map image from the XWeather API.
+class WeatherApiService(weewx.engine.StdService):
+    """Class to obtain weather data from one or more weather APIs.
 
-    [WeatherMap]
-        [[XWeather]]
-            enabled = True
-            client_id =
-            client_secret =
-            url_stem = "flat,radar,states/600x500/Brisbane,qld,4/current.png"
-            destination =
+    [WeatherAPI]
+        [[SomeName]]
+            source = abc
+            enable = True | False
+            debug = 0 | 1 | 2 | 3
+            ....
+            check_queue_event = NEW_LOOP_PACKET | CHECK_LOOP |
+                                NEW_ARCHIVE_RECORD | POST_LOOP
+            [field_map]]
+                weewx_field = api_field
+                unit = weewx_unit_name
+
     """
 
     def __init__(self, engine, config_dict):
         # initialise our superclass
-        super(XWeatherMapService, self).__init__(engine, config_dict)
-        # get the XWeather config accumulating leaves
-        xw_dict = weeutil.config.accumulateLeaves(config_dict['WeatherMap']['XWeather'])
-        # are we enabled
-        if weeutil.weeutil.to_bool(xw_dict.get('enable', False)):
-            # we are enabled
-            # set our debug level
-            self.debug = weeutil.weeutil.to_int(xw_dict.get('debug', 0))
-            # get the ID, secret and URL stem to be used, wrap is a try..except
-            # to simplify processing if one or both config items are missing
-            try:
-                id = xw_dict['id']
-                secret = xw_dict['secret']
-                url_stem = xw_dict['url_stem']
-            except KeyError:
-                log.error('XWeatherMapService: ID and/or secret and/or '
-                          'URL stem not specified. Exiting.')
-                # we cannot continue, just return and this service will remain
-                # in the list of services but in effect it will do nothing
-                return
-            # now get a collector
-            self.collector = XWeatherMapCollector(config_dict=config_dict,
-                                                  collector_dict=xw_dict,
-                                                  id=id,
-                                                  secret=secret,
-                                                  url_stem=url_stem)
-            # start the collector in its own thread
-            self.collector.startup('XWeatherMapCollectorThread')
-            # bind ourself to the WeeWX CHECK_LOOP event
-            self.bind(weewx.CHECK_LOOP, self.check_loop)
+        super(WeatherApiService, self).__init__(engine, config_dict)
+        # obtain the WeatherApi config stanza
+        api_config = config_dict.get('WeatherAPI')
+        # we can only continue is we have a config stanza, if we don't have a
+        # config stanza we're done
+        if api_config is None:
+            return
+        # obtain our debug value
+        self.debug = weeutil.weeutil.to_int(api_config.get('debug', 0))
+        if weewx.debug >= 1 or self.debug >= 1:
+            log.info("WeatherApiService v%s" % WEATHER_API_VERSION)
+        # initialise a dict to hold our active sources
+        self.sources = dict()
+        # iterate over the sections of our config, each section is the config
+        # for one source
+        for source in api_config.sections:
+            # get the source config with accumulated leaves
+            source_config = weeutil.config.accumulateLeaves(api_config[source])
+            # log the config if debug >= 2
+            if self.debug >= 2:
+                log.info("WeatherApiService: '%s' config=%s" % (source,
+                                                                source_config))
+            # is this source enabled
+            enable = weeutil.weeutil.to_bool(source_config.get('enable',
+                                                               False))
+            if 'source' in source_config and source_config['source'] in KNOWN_SOURCES.keys() and enable:
+                # we have a source config dict and the source is enabled
+                # obtain Queue objects for the control and data queues
+                control_queue = queue.Queue()
+                data_queue = queue.Queue()
+                # now get an appropriate threaded source object
+                source_obj = self.source_factory(config_dict,
+                                                 source_config,
+                                                 control_queue,
+                                                 data_queue)
+                # did we get a source object, if we didn't then log it and
+                # continue to the next source config
+                if source_obj is None:
+                    loginf("Source config [[%s]] ignored. Unsupported "
+                           "source '%s'." % (source,
+                                             source_config['source']))
+                    continue
+                # otherwise we have a source object, so add it to our dict of
+                # active sources
+                self.sources[source] = {'name': source_config.get('name',
+                                                                  source),
+                                        'obj': source_obj,
+                                        'control': control_queue,
+                                        'data': data_queue,
+                                        'event': source_config.get('check_queue_event',
+                                                                   'NEW_LOOP_PACKET').upper()
+                                        }
+                # now start the sources' thread
+                self.sources[source]['obj'].startup(self.sources[source]['name'])
+                # finally, let the user know what we did
+                loginf("Started source '%s'" % self.sources[source]['name'])
+            elif 'source' not in source_config:
+                # no source was specified
+                loginf("No source specified in section [[%s]]" % source)
+            elif source_config['source'] not in KNOWN_SOURCES.keys():
+                # an invalid source was specified
+                loginf("Invalid source '%s' specified" % source_config['source'])
+            elif not enable:
+                # the source was not enabled
+                loginf("Source '%s' ignored, not enabled" % source_config['source'])
+            else:
+                # we should not end up here
+                loginf("Source '%s' ignored" % source_config['source'])
+        # initialise a list to hold a list of sources for deletion
+        self.pop_list = list()
+        # set event bindings
+        # bind to NEW_LOOP_PACKET
+        self.bind(weewx.NEW_LOOP_PACKET, self.new_loop_packet)
+        # bind to CHECK_LOOP
+        self.bind(weewx.CHECK_LOOP, self.check_loop)
+        # bind to NEW_ARCHIVE_RECORD
+        self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
+        # bind to POST_LOOP
+        self.bind(weewx.POST_LOOP, self.post_loop)
+
+    @staticmethod
+    def source_factory(config_dict, source_config, control_queue, data_queue):
+        """Factory method to produce a weather API source object."""
+
+        # get the source class name
+        source_class = KNOWN_SOURCES.get(source_config['source'])['class']
+        if source_class is not None:
+            # get the source object
+            source_object = source_class(config_dict,
+                                         source_config,
+                                         control_queue,
+                                         data_queue)
+            # return the source object
+            return source_object
         else:
-            # we are not enabled, log this at the debug level
-            if weewx.debug >= 1 or self.debug >= 1:
-                loginf("XWeatherMapService: XWeatherMapService ignored")
+            # source class is None - we have no class for this source
+            return None
 
-    def check_loop(self, event):
-        """Process the queue.
+    def new_loop_packet(self, event):
+        """Process the sources bound to a new loop packet being created.
 
-        The collector thread queue is used for receiving requests for the
-        collector thread to close or for reporting of details of exceptions
-        encountered by the thread. Once the incoming loop packet has been
-        processed check the collector thread queue for any such requests or
-        reports and process them as required.
+        Iterate over the list of active sources and process the queue for those
+        sources bound to the NEW_LOOP_PACKET event.
         """
 
+        # iterate over the active sources
+        for source_key, source in self.sources.items():
+            # is the source 'bound' to the NEW_LOOP_PACKET event
+            if source['event'] == 'NEW_LOOP_PACKET':
+                # the source is 'bound' to the NEW_LOOP_PACKET event so process
+                # the queues for that source
+                self.process_queue(source_key)
+        # remove any closed sources
+        self.pop_closed_sources()
+
+    def check_loop(self, event):
+        """Process the sources bound to the completion of loop packet processing.
+
+        Iterate over the list of active sources and process the queue for those
+        sources bound to the CHECK_LOOP event.
+        """
+
+        # iterate over the active sources
+        for source_key, source in self.sources.items():
+            # is the source 'bound' to the CHECK_LOOP event
+            if source['event'] == 'CHECK_LOOP':
+                # the source is 'bound' to the CHECK_LOOP event so process
+                # the queues for that source
+                self.process_queue(source_key)
+        # remove any closed sources
+        self.pop_closed_sources()
+
+    def new_archive_record(self, event):
+        """Process the sources bound to a new archive record being created.
+
+        Iterate over the list of active sources and process the queue for those
+        sources bound to the NEW_ARCHIVE_RECORD event.
+        """
+
+        # iterate over the active sources
+        for source_key, source in self.sources.items():
+            # is the source 'bound' to the NEW_ARCHIVE_RECORD event
+            if source['event'] == 'NEW_ARCHIVE_RECORD':
+                # the source is 'bound' to the NEW_ARCHIVE_RECORD event so process
+                # the queues for that source
+                self.process_queue(source_key)
+        # remove any closed sources
+        self.pop_closed_sources()
+
+    def post_loop(self, event):
+        """Process the sources bound to the breaking of main processing loop.
+
+        Iterate over the list of active sources and process the queue for those
+        sources bound to the POST_LOOP event.
+        """
+
+        # iterate over the active sources
+        for source_key, source in self.sources.items():
+            # is the source 'bound' to the POST_LOOP event
+            if source['event'] == 'POST_LOOP':
+                # the source is 'bound' to the POST_LOOP event so process
+                # the queues for that source
+                self.process_queue(source_key)
+        # remove any closed sources
+        self.pop_closed_sources()
+
+    def process_queue(self, source_key):
+        """Process the data queue for a given source."""
+
+        # obtain the source data from the list of active sources
+        source = self.sources[source_key]
         # process the queue until it is empty
         while True:
-            # Get the next item from the queue. Wrap in a try..except to catch
-            # any instances where the queue is empty as that is our signal to
-            # break out of the while loop.
+            # Get the next item from the queue. Wrap in a try .. except to
+            # catch any instances where the queue is empty as that is our
+            # signal to break out of the while loop.
             try:
-                # get the next item from the collector queue, but don't dwell
-                # very long
-                queue_data = self.collector.queue.get(True, 0.5)
+                # get the next item from the queue, but don't dwell very long
+                _data = source['data'].get(True, 0.5)
             except queue.Empty:
-                # the queue is now empty, but that may be because we have
-                # already processed any queued data, log if necessary and break
-                # out of the while loop
-                logdbg('XWeatherMapService: No queued items to process')
+                # the queue is empty, that may be because there was never
+                # anything in the queue or because we have already processed
+                # any queued data; either way log if necessary and break out of
+                # the while loop
+                if self.debug >= 1:
+                    loginf('WeatherApiService: %s: No queued items to process' % source['name'])
                 # now break out of the while loop
                 break
             else:
-                # We received something in the queue, it will be one of two
+                # We received something in the queue, it will be one of three
                 # things:
-                # 1. an exception
-                # 2. the value None signalling a serious error that means the
-                #    Collector needs to shut down
+                # 1. data from the API
+                # 2. an exception
+                # 3. the value None signalling a serious error that means the
+                #    source thread needs to shut down
+
+                # if it is 'data' it will be in a dict and have keys
+                if hasattr(_data, 'keys'):
+                    # obtain the process function for this source
+                    process_fn = getattr(self, '_'.join(['process', source['source'].lower()]))
+                    # call the process function
+                    process_fn(_data)
 
                 # if it's a tuple then it's a tuple with an exception and
                 # exception text
-                if isinstance(queue_data, BaseException):
-                    # We have an exception. The collector did not deem it
-                    # serious enough to want to shut down, or it would have
-                    # sent None instead. The action we take depends on the type
-                    # of exception it is. If it's a GWIOError we can ignore it
-                    # as appropriate action will have been taken by the
-                    # GatewayCollector. If it is anything else we log it.
-                    # process the exception
-                    self.process_queued_exception(queue_data)
+                elif isinstance(_data, BaseException):
+                    # We have an exception. The source did not deem it serious
+                    # enough to want to shut down, or it would have sent None
+                    # instead. The action we take depends on the type of
+                    # exception it is and the source.
+                    self.process_queued_exception(_data, source_key)
 
-                # if it's None then it's a signal the Collector needs to shut down
-                elif queue_data is None:
+                # if it's None then it's a signal the source needs to shut down
+                elif _data is None:
                     # log what we received
-                    loginf('XWeatherMapService: Received collector shutdown signal')
-                    # we received the signal that the Collector needs to shut
+                    loginf('WeatherApiService: %s: Received source '
+                           'shutdown signal' % source['name'])
+                    # we received the signal that the source needs to shut
                     # down, that means we cannot continue so call our shutdown
-                    # method which will also shut down the Collector thread
-                    self.shutDown()
-                    # The Collector has been shut down, so we will not see
-                    # anything more in the queue. We are still bound to
-                    # NEW_LOOP_PACKET but since the queue is always empty we
-                    # will just wait for the empty queue timeout before exiting
+                    # method which will also shut down the relevant source
+                    # thread
+                    self.shut_down_source(source)
+                    # we have told the source to close, mark the source for
+                    # deletion when we have finished processing all of our
+                    # sources
+                    self.pop_list.append(source_key)
+                    # The source has been shut down, so we will not see
+                    # anything more in the queue. We are still bound to an
+                    # event, but since the queue is always empty we will just
+                    # wait for the empty queue timeout before exiting
 
                 # if it's none of the above (which it should never be) we don't
                 # know what to do with it so pass and wait for the next item in
                 # the queue
                 else:
                     pass
-        # we have now finished processing the queue, since we don't receive
-        # data we are finished
 
-    @staticmethod
-    def process_queued_exception(e):
-        """Process an exception received in the collector queue."""
+    def process_queued_exception(self, e, source_key):
+        """Process an exception received in a source queue."""
 
         # we have no exceptions particular to our service, so just log the
         # error and continue
-        logerr('XWeatherMapService: Collector thread caught unexpected'
-               ' exception %s: %s' % (e.__class__.__name__, e))
+        logerr('WeatherApiService: %s: Source thread caught unexpected'
+               ' exception %s: %s' % (self.sources[source_key]['name'],
+                                      e.__class__.__name__,
+                                      e))
+
+    def pop_closed_sources(self):
+        """Remove any closed sources from the list of active sources."""
+
+        # iterate over the list of closed sources
+        for source_key in self.pop_list:
+            # remove the closed source from the active sources list
+            _ignore = self.sources.pop(source_key, None)
+        # we are done, reset the pop list
+        self.pop_list = list()
+
+    def shut_down_source(self, source_dict):
+        """Shut down a source."""
+
+        # The source will likely be running in a thread. Call its shutdown()
+        # method so that any thread shut down/tidy up can occur
+        source_dict['obj'].shutdown()
 
     def shutDown(self):
         """Shut down the service."""
 
-        # the collector will likely be running in a thread, so call its
-        # shutdown() method so that any thread shut down/tidy up can occur
-        self.collector.shutdown()
+        # Any active sources will likely still be running in their own thread.
+        # Iterate over any sources still active and shut down each so that any
+        # thread shut down/tidy up can occur
+        for source_key in self.sources:
+            self.shut_down_source(self.sources[source_key])
+
+    def noop(self, *args, **kwargs):
+        """Dummy method to accept any parameters but do nothing."""
+
+        pass
+
+    # XWeather maps does no processing of received data (other than saving a
+    # file) so set the process function to do nothing
+    process_xwm = noop
 
 
 # ============================================================================
-#                         class XWeatherMapCollector
+#                          class XWeatherMapSource
 # ============================================================================
 
-class XWeatherMapCollector(Collector):
-    """Threaded class that obtains weather map images via the XWeather API."""
+class XWeatherMapSource(Source):
+    """Threaded class to obtain weather map images via the XWeather API."""
 
     # XWeather map API end point
     END_POINT = 'https://maps.aerisapi.com'
 
-    def __init__(self, config_dict, collector_dict, id, secret, url_stem):
+    def __init__(self, config_dict, source_dict, control_queue, data_queue):
         # initialize my base class
-        super(XWeatherMapCollector, self).__init__(collector_dict)
+        super(XWeatherMapSource, self).__init__(source_dict, control_queue, data_queue)
+        # get the ID, secret and URL stem to be used, wrap is a try..except
+        # to simplify processing if one or both config items are missing
+        try:
+            self.id = source_dict['id']
+            self.secret = source_dict['secret']
+            url_stem = source_dict['url_stem']
+        except KeyError:
+            log.error('XWeatherMapSource: ID and/or secret and/or '
+                      'URL stem not specified. Exiting.')
+            # we cannot continue, just return and this service will remain
+            # in the list of services but in effect it will do nothing
+            return
         # get an identifying prefix to use to identify this thread and when
         # logging
-        self.name = 'XWeatherMapCollector'
-        # set our debug level
-        self.debug = weeutil.weeutil.to_int(collector_dict.get('debug', 0))
-        # save our ID and secret
-        self.id = id
-        self.secret = secret
+        self.name = 'XWeatherMapSource'
         # construct the ID and secret string to be used in our URL
-        id_secret = '_'.join([id, secret])
+        id_secret = '_'.join([self.id, self.secret])
         # now construct the URL we will use for our map
         self.url = '/'.join([self.END_POINT, id_secret, url_stem])
         # obtain the HTML_ROOT setting from StdReport
         html_root = os.path.join(config_dict['WEEWX_ROOT'],
                                  config_dict['StdReport']['HTML_ROOT'])
         # obtain the destination for the retrieved file
-        _path = collector_dict.get('destination', html_root).strip()
+        _path = source_dict.get('destination', html_root).strip()
         _file = os.path.basename(url_stem)
         # now we can construct the destination path and file name
         self.destination = os.path.join(html_root, _path, _file)
         _path, _file = os.path.split(self.destination)
         if not os.path.exists(_path):
             if self.debug >= 1:
-                logdbg("XWeatherMapCollector: Creating destination path '%s'")
+                logdbg("XWeatherMapSource: Creating destination path '%s'" % _path)
             os.makedirs(_path)
         # interval between API calls, default to 30 minutes
-        self.interval = weeutil.weeutil.to_int(collector_dict.get('interval',
-                                                                  1800))
+        self.interval = weeutil.weeutil.to_int(source_dict.get('interval',
+                                                               1800))
         # Get API call lockout period. This is the minimum period between API
         # calls. This prevents an error condition making multiple rapid API
         # calls and thus potentially breaching the API usage conditions.
@@ -512,12 +696,12 @@ class XWeatherMapCollector(Collector):
         # the maximum API calls per minute, we will be conservative and
         # default limit our calls to no more often than once every 10
         # seconds. The user can increase or decrease this value.
-        self.lockout_period = weeutil.weeutil.to_int(collector_dict.get('api_lockout_period',
-                                                                        10))
+        self.lockout_period = weeutil.weeutil.to_int(source_dict.get('api_lockout_period',
+                                                                     10))
         # maximum number of attempts to obtain a response from the API
         # before giving up
-        self.max_tries = weeutil.weeutil.to_int(collector_dict.get('max_tries',
-                                                                   3))
+        self.max_tries = weeutil.weeutil.to_int(source_dict.get('max_tries',
+                                                                3))
         # initialise a property to hold the timestamp the API was last called
         self.last_call_ts = None
 
@@ -639,3 +823,20 @@ class XWeatherMapCollector(Collector):
                                                                            self.max_tries))
         # if we made it here we have nothing so return None
         return None
+
+
+# ============================================================================
+#                          class XWeatherMapSource
+# ============================================================================
+
+class OpenWeatherSource(Source):
+    """Threaded class that obtains weather data via the OpenWeather API."""
+
+    def __init__(self, config_dict, source_dict, control_queue, data_queue):
+            # initialize my base class
+            super(OpenWeatherSource, self).__init__(source_dict, control_queue, data_queue)
+
+
+KNOWN_SOURCES = {'OW': {'class': OpenWeatherSource},
+                 'XWM': {'class': XWeatherMapSource}
+                 }
