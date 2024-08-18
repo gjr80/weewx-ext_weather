@@ -119,6 +119,6 @@ class ExtWeatherInstaller(ExtensionInstaller):
             description='WeeWX service for obtaining data from an external Weather API.',
             author="Gary Roderick",
             author_email="gjroderick<@>gmail.com",
-            files=[('bin/user', ['bin/user/weather_api.py'])],
+            files=[('bin/user', ['bin/user/weatherapi.py'])],
             config=ext_weather_dict
         )
