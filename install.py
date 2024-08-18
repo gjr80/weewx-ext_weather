@@ -10,7 +10,7 @@ PARTICULAR PURPOSE.  See the GNU General Public License for more details.
 
                       Installer for External Weather service
 
-Version: 0.3.0a1                                       Date: xx August 2024
+Version: 0.3.0a2                                       Date: xx August 2024
 
 Revision History
     xx August 2024      v0.3.0
@@ -29,7 +29,7 @@ import weewx
 
 
 REQUIRED_WEEWX_VERSION = "3.0.0"
-WEATHER_API_VERSION = "0.3.0a1"
+WEATHER_API_VERSION = "0.3.0a2"
 # define our config as a multiline string so we can preserve comments
 ext_weather_config = """
 [WeatherAPI]

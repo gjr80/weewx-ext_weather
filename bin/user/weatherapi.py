@@ -14,7 +14,7 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
 details.
 
-Version: 0.3.0a1                                    Date: xx August 2024
+Version: 0.3.0a2                                    Date: xx August 2024
 
 Revision History
     xx August 2024      v0.3.0
@@ -105,7 +105,7 @@ except ImportError:
     def log_traceback_error(prefix=''):
         log_traceback(prefix=prefix, loglevel=syslog.LOG_ERR)
 
-WEATHER_API_VERSION = "0.3.0a1"
+WEATHER_API_VERSION = "0.3.0a2"
 
 # ============================================================================
 #                                class Source
