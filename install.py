@@ -35,6 +35,12 @@ ext_weather_config = """
 [WeatherAPI]
     # This section is for the External Weather API service.
 
+    # whether to log a successful operation
+    log_success = True
+    
+    # whether to log an unsuccessful operation
+    log_failure = True
+    
     # debug setting fpr all sources, may be 0, 1, 2 or 3, default is 0
     debug = 0
     

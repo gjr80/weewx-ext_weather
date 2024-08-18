@@ -118,6 +118,12 @@ class Source(object):
         self.control_queue = control_queue
         self.data_queue = data_queue
         self.thread = None
+        self.log_success = weeutil.weeutil.to_bool(weeutil.config.search_up(source_dict,
+                                                                            'log_success',
+                                                                            True))
+        self.log_failure = weeutil.weeutil.to_bool(weeutil.config.search_up(source_dict,
+                                                                            'log_failure',
+                                                                            True))
         self.debug = weeutil.weeutil.to_int(source_dict.get('debug', 0))
         self.name = source_dict.get('name', 'api_source')
         self.max_tries = weeutil.weeutil.to_int(source_dict.get('max_tries', 2))
@@ -198,7 +204,7 @@ class Source(object):
             # construct our data dict for the queue
             _package = {'type': 'data',
                         'payload': data}
-            self.queue.put(_package)
+            self.data_queue.put(_package)
 
     def submit_request(self, url, headers=None):
         """Submit a HTTP GET API request with retries and return the result.
@@ -220,13 +226,15 @@ class Source(object):
             try:
                 w = urllib.request.urlopen(req)
             except urllib.error.HTTPError as err:
-                logerr("%s: Failed to get API response on attempt %d" % (self.name,
+                if self.log_failure:
+                    logerr("%s: Failed to get API response on attempt %d" % (self.name,
                                                                          count + 1,))
-                logerr("   **** %s" % err)
+                    logerr("   **** %s" % err)
             except (urllib.error.URLError, socket.timeout) as e:
-                logerr("%s: Failed to get API response on attempt %d" % (self.name,
+                if self.log_failure:
+                    logerr("%s: Failed to get API response on attempt %d" % (self.name,
                                                                          count + 1,))
-                logerr("%s:   **** %s" % (self.name, e))
+                    logerr("%s:   **** %s" % (self.name, e))
             else:
                 # We have a response, but it could be character set encoded.
                 # Get the charset used so we can decode the stream correctly.
@@ -242,7 +250,8 @@ class Source(object):
                 return response
         else:
             # no response after max_tries attempts, so log it
-            logerr("%s: Failed to get API response" % self.name)
+            if self.log_failure:
+                logerr("%s: Failed to get API response" % self.name)
         # if we made it here we have not been able to obtain a response so
         # return None
         return None
@@ -692,10 +701,10 @@ class XWeatherMapSource(Source):
         # Get API call lockout period. This is the minimum period between API
         # calls. This prevents an error condition making multiple rapid API
         # calls and thus potentially breaching the API usage conditions.
-        # The Aeris Weather API does specify a plan dependent figure for
-        # the maximum API calls per minute, we will be conservative and
-        # default limit our calls to no more often than once every 10
-        # seconds. The user can increase or decrease this value.
+        # The XWeather API does specify a plan dependent figure for the
+        # maximum API calls per minute, we will be conservative and default
+        # limit our calls to no more often than once every 10 seconds. The user
+        # can increase or decrease this value.
         self.lockout_period = weeutil.weeutil.to_int(source_dict.get('api_lockout_period',
                                                                      10))
         # maximum number of attempts to obtain a response from the API
@@ -762,11 +771,12 @@ class XWeatherMapSource(Source):
                 # make the API call and return the response, we will discard the
                 # response after some response based logging
                 _result = self.submit_request()
-                # log the result
-                if weewx.debug >= 1 or self.debug >= 1:
-                    if _result is not None:
+                # log the result, if we successfully downloaded the file log it,
+                if _result is not None:
+                    if self.log_success:
                         loginf("%s: successfully downloaded '%s'" % (self.name, _result))
-                    else:
+                else:
+                    if self.log_success:
                         loginf("%s: failed to obtain API response" % self.name)
         # we have nothing to return, so return None
         return None
@@ -794,24 +804,28 @@ class XWeatherMapSource(Source):
                 (file_name, headers) = urllib.request.urlretrieve(self.url,
                                                                   self.destination)
             except urllib.error.HTTPError as err:
-                log.error("Failed to get %s API response on attempt %d" % (self.name,
-                                                                           count + 1))
-                log.error("   **** %s" % err)
+                if self.log_success:
+                    log.error("Failed to get %s API response on attempt %d" % (self.name,
+                                                                               count + 1))
+                    log.error("   **** %s" % err)
                 if err.code == 403:
                     # XWeather has not listed specific HTTP response error
                     # codes, but we know an incorrect client ID or secret results
                     # in a 403 error as does an invalid URL stem
-                    log.error("   **** Possible incorrect client credentials or URL stem")
+                    if self.log_success:
+                        log.error("   **** Possible incorrect client credentials or URL stem")
                     # we cannot continue with these errors so return
                     break
             except (urllib.error.URLError, socket.timeout) as e:
-                log.error("Failed to get %s API response on attempt %d" % (self.name,
-                                                                           count + 1))
-                log.error("   **** %s" % e)
+                if self.log_failure:
+                    log.error("Failed to get %s API response on attempt %d" % (self.name,
+                                                                               count + 1))
+                    log.error("   **** %s" % e)
             except Exception as e:
-                log.error("An unexpected error occurred on %s API "
-                          "response attempt %d" % (self.name, count + 1))
-                log.error("   **** %s" % e)
+                if self.log_failure:
+                    log.error("An unexpected error occurred on %s API "
+                              "response attempt %d" % (self.name, count + 1))
+                    log.error("   **** %s" % e)
             else:
                 # we had a successful retrieval, first update the time of last call
                 self.last_call_ts = time.time()
@@ -819,8 +833,9 @@ class XWeatherMapSource(Source):
                 return file_name
         else:
             # no response after max_tries attempts, so log it
-            log.error("Failed to get %s API response after %d attempts" % (self.name,
-                                                                           self.max_tries))
+            if self.log_failure:
+                log.error("Failed to get %s API response after %d attempts" % (self.name,
+                                                                               self.max_tries))
         # if we made it here we have nothing so return None
         return None
 
