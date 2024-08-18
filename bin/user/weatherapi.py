@@ -718,8 +718,8 @@ class XWeatherMapSource(Source):
                                                                              self.max_tries))
         # detailed client and URL info when debug >= 2
         if weewx.debug >= 2 or self.debug >= 2:
-            loginf("    client ID=%s" % self.obfuscated(id))
-            loginf("    client secret=%s" % self.obfuscated(secret))
+            loginf("    client ID=%s" % self.obfuscated(self.id))
+            loginf("    client secret=%s" % self.obfuscated(self.secret))
             loginf("    URL stem=%s" % url_stem)
         # create a thread property
         self.thread = None
