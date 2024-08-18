@@ -1,0 +1,11 @@
+v0.3.0
+-   restructured such that a single service (WeatherApiService) now runs
+    multiple threads with one weather API supported per thread
+-   change Collector/collector terminology to Source/source
+v0.2.0
+-   refactored to use python 3.6 or later
+-   refactored thread management to better handle thread closure
+-   implemented a single XWeather Map service
+-   removed six.moves dependency
+v0.1.0
+-   initial release
